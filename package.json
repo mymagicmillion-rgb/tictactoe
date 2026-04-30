@@ -1,6 +1,6 @@
 {
   "name": "uttt-server",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "description": "Multiplayer server for Ultimate Tic-Tac-Toe",
   "main": "server.js",
   "scripts": {
@@ -9,6 +9,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.18.2",
-    "socket.io": "^4.8.1"
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.3"
   }
 }

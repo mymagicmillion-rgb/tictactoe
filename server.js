@@ -6,6 +6,10 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
+app.get('/', (req, res) => {
+    res.send('UTTT Server is running. Active rooms: ' + rooms.size);
+});
+
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
@@ -14,12 +18,42 @@ const io = new Server(server, {
     }
 });
 
-// Store active rooms. Key = roomCode, Value = { host: socketId, guest: socketId, xTurn: true }
-const rooms = {};
+/**
+ * Room state:
+ * { 
+ *   host: socketId, 
+ *   guest: socketId, 
+ *   lastWinner: 'X'|'O'|'DRAW'|null,
+ *   assignments: { socketId: 'X'|'O' }
+ * }
+ */
+const rooms = new Map();
+const socketToRoom = new Map();
 
-// Generate random 4-char code
+/**
+ * Generates a random 4-character room code.
+ */
 function generateCode() {
-    return Math.random().toString(36).substring(2, 6).toUpperCase();
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let code = '';
+    for (let i = 0; i < 4; i++) {
+        code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return code;
+}
+
+/**
+ * Randomly assigns X and O to two players.
+ * @param {string} id1 - First socket ID.
+ * @param {string} id2 - Second socket ID.
+ * @returns {Object} Mapping of socket ID to symbol.
+ */
+function assignRandomSymbols(id1, id2) {
+    const symbols = Math.random() < 0.5 ? ['X', 'O'] : ['O', 'X'];
+    return {
+        [id1]: symbols[0],
+        [id2]: symbols[1]
+    };
 }
 
 io.on('connection', (socket) => {
@@ -27,65 +61,125 @@ io.on('connection', (socket) => {
 
     // Host creates a game
     socket.on('create_game', () => {
-        let code = generateCode();
-        while (rooms[code]) {
-            code = generateCode(); // Ensure uniqueness
+        try {
+            let code = generateCode();
+            let attempts = 0;
+            while (rooms.has(code) && attempts < 100) {
+                code = generateCode();
+                attempts++;
+            }
+            
+            rooms.set(code, { 
+                host: socket.id, 
+                guest: null, 
+                lastWinner: null,
+                assignments: {} 
+            });
+            socketToRoom.set(socket.id, code);
+            socket.join(code);
+            
+            console.log(`Room ${code} created by ${socket.id}`);
+            socket.emit('game_created', { code });
+        } catch (e) {
+            console.error('Error in create_game:', e);
         }
-        
-        rooms[code] = { host: socket.id, guest: null };
-        socket.join(code);
-        
-        console.log(`Room ${code} created by ${socket.id}`);
-        socket.emit('game_created', { code });
     });
 
     // Guest joins a game
     socket.on('join_game', ({ code }) => {
-        const roomCode = code.toUpperCase();
-        const room = rooms[roomCode];
+        try {
+            if (!code || typeof code !== 'string') {
+                socket.emit('error', { message: 'Некорректный код!' });
+                return;
+            }
 
-        if (!room) {
-            socket.emit('error', { message: 'Комната не найдена!' });
-            return;
+            const roomCode = code.toUpperCase();
+            const room = rooms.get(roomCode);
+
+            if (!room) {
+                socket.emit('error', { message: 'Комната не найдена!' });
+                return;
+            }
+
+            if (room.guest) {
+                socket.emit('error', { message: 'Комната полная!' });
+                return;
+            }
+
+            room.guest = socket.id;
+            socketToRoom.set(socket.id, roomCode);
+            socket.join(roomCode);
+            
+            // Randomly assign symbols for the first game
+            room.assignments = assignRandomSymbols(room.host, room.guest);
+
+            console.log(`${socket.id} joined room ${roomCode}`);
+
+            // Send each player their own symbol directly (avoids socket ID lookup issues)
+            io.to(room.host).emit('game_start', { mySymbol: room.assignments[room.host], startingPlayer: 'X' });
+            io.to(room.guest).emit('game_start', { mySymbol: room.assignments[room.guest], startingPlayer: 'X' });
+        } catch (e) {
+            console.error('Error in join_game:', e);
         }
-
-        if (room.guest) {
-            socket.emit('error', { message: 'Комната уже полная!' });
-            return;
-        }
-
-        room.guest = socket.id;
-        socket.join(roomCode);
-        
-        console.log(`${socket.id} joined room ${roomCode}`);
-        socket.emit('game_joined', { code: roomCode, symbol: 'O' });
-        
-        // Notify host that guest joined
-        io.to(room.host).emit('guest_joined');
-        
-        // Start game
-        io.to(roomCode).emit('game_start');
     });
 
     // Make a move
     socket.on('make_move', ({ code, boardIdx, cellIdx }) => {
-        // Just broadast the move to everyone in the room except sender
-        socket.to(code).emit('opponent_move', { boardIdx, cellIdx });
+        try {
+            if (!code || typeof boardIdx !== 'number' || typeof cellIdx !== 'number') return;
+            socket.to(code).emit('opponent_move', { boardIdx, cellIdx });
+        } catch (e) {
+            console.error('Error in make_move:', e);
+        }
+    });
+
+    // Notify server about game result
+    socket.on('game_result', ({ code, winner }) => {
+        try {
+            const room = rooms.get(code);
+            if (room) {
+                room.lastWinner = winner; // 'X', 'O', or 'DRAW'
+                console.log(`Room ${code} result: ${winner}`);
+            }
+        } catch (e) {}
     });
 
     // Restart request
     socket.on('restart_request', ({ code }) => {
-        socket.to(code).emit('restart_game');
+        try {
+            const room = rooms.get(code);
+            if (!room) return;
+
+            // Logic: Loser starts first (gets 'X')
+            if (room.lastWinner && room.lastWinner !== 'DRAW') {
+                // Find who was the winner symbol
+                const winnerSocket = Object.keys(room.assignments).find(sid => room.assignments[sid] === room.lastWinner);
+                const loserSocket = (winnerSocket === room.host) ? room.guest : room.host;
+                
+                // Loser gets X, Winner gets O
+                room.assignments = {
+                    [loserSocket]: 'X',
+                    [winnerSocket]: 'O'
+                };
+            } else {
+                // DRAW or first game restart (before result) -> Random
+                room.assignments = assignRandomSymbols(room.host, room.guest);
+            }
+
+            // Send each player their own symbol directly
+            io.to(room.host).emit('restart_game', { mySymbol: room.assignments[room.host], startingPlayer: 'X' });
+            io.to(room.guest).emit('restart_game', { mySymbol: room.assignments[room.guest], startingPlayer: 'X' });
+        } catch (e) {
+            console.error('Error in restart_request:', e);
+        }
     });
 
     socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
-        // Find if user was in a room and clean up
-        for (const [code, room] of Object.entries(rooms)) {
-            if (room.host === socket.id || room.guest === socket.id) {
-                io.to(code).emit('player_left');
-                delete rooms[code];
-            }
+        const code = socketToRoom.get(socket.id);
+        if (code) {
+            io.to(code).emit('player_left');
+            rooms.delete(code);
+            socketToRoom.delete(socket.id);
         }
     });
 });
